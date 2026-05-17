@@ -67,7 +67,20 @@ create table if not exists checkins (
   created_at timestamptz default now()
 );
 
--- 6. AUDIT LOG
+-- 6. ESCALATIONS (rule-based escalation log)
+create table if not exists escalations (
+  id uuid primary key default gen_random_uuid(),
+  rule_id text not null,
+  entity_type text not null check (entity_type in ('goal','employee')),
+  entity_id uuid not null,
+  employee_id uuid references users(id),
+  escalated_to text not null check (escalated_to in ('manager','admin','employee')),
+  message text not null,
+  status text default 'open' check (status in ('open','resolved')),
+  created_at timestamptz default now()
+);
+
+-- 7. AUDIT LOG
 create table if not exists audit_log (
   id uuid primary key default gen_random_uuid(),
   goal_id uuid references goals(id),
@@ -102,6 +115,7 @@ alter table goals disable row level security;
 alter table achievements disable row level security;
 alter table checkins disable row level security;
 alter table audit_log disable row level security;
+alter table escalations disable row level security;
 alter table goal_cycles disable row level security;
 
 -- ============================================================

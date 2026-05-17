@@ -20,6 +20,425 @@ const msalInstance = new PublicClientApplication(msalConfig);
 // Init MSAL instance asynchronously
 msalInstance.initialize().catch(()=>console.log("MSAL Init Error"));
 
+// ── Notification Service (Email & Teams) ───────────────────────────────────────
+const NotificationService = {
+  TEAMS_WEBHOOK_URL: "https://YOUR_TENANT.webhook.office.com/webhookb2/...", // Replace with real webhook
+
+  async sendTeamsCard(title, text, linkUrl, linkText) {
+    if (!this.TEAMS_WEBHOOK_URL || this.TEAMS_WEBHOOK_URL.includes("YOUR_TENANT")) {
+      console.log("[MOCK TEAMS MSG]", { title, text, linkUrl });
+      return;
+    }
+    const card = {
+      "@type": "MessageCard",
+      "@context": "http://schema.org/extensions",
+      "themeColor": "6366f1",
+      "summary": title,
+      "sections": [{ "activityTitle": title, "activitySubtitle": text, "markdown": true }],
+      "potentialAction": [{
+        "@type": "OpenUri",
+        "name": linkText || "Open Portal",
+        "targets": [{ "os": "default", "uri": linkUrl }]
+      }]
+    };
+    fetch(this.TEAMS_WEBHOOK_URL, { method: "POST", body: JSON.stringify(card) }).catch(console.error);
+  },
+
+  async sendEmail(toEmail, subject, body) {
+    // In production, use Edge functions/SendGrid
+    console.log(`[MOCK EMAIL] To: ${toEmail} | Sub: ${subject} | Body: ${body}`);
+  },
+
+  async notifySubmission(employeeName, managerEmail, employeeId) {
+    const link = `${window.location.origin}/?page=approvals&emp=${employeeId}`;
+    await this.sendEmail(managerEmail, "Goals Submitted for Approval", `${employeeName} submitted goals.`);
+    await this.sendTeamsCard("Goal Submission", `**${employeeName}** has submitted new goals for approval.`, link, "Review Goals");
+  },
+
+  async notifyApproval(employeeEmail) {
+    const link = `${window.location.origin}/?page=my-goals`;
+    await this.sendEmail(employeeEmail, "Goals Approved", "Your manager approved your goals and they are locked.");
+    await this.sendTeamsCard("Goals Approved", "Your goals have been officially approved and locked.", link, "View Goals");
+  },
+
+  async notifyRework(employeeEmail) {
+    const link = `${window.location.origin}/?page=my-goals`;
+    await this.sendEmail(employeeEmail, "Goals Returned for Rework", "Your manager requested changes to your goals.");
+    await this.sendTeamsCard("Goals Need Rework", "Your manager has returned your goals for rework.", link, "Edit Goals");
+  },
+
+  async notifyCheckinReminder(employeeEmail, employeeName, quarter) {
+    const link = `${window.location.origin}/?page=checkins`;
+    await this.sendEmail(employeeEmail, `Reminder: ${quarter} Update Due`, `Hi ${employeeName}, please update your ${quarter} goal actuals.`);
+    await this.sendTeamsCard("Check-in Reminder", `Hi **${employeeName}**, a friendly reminder to log your actual achievements for **${quarter}**.`, link, "Update Check-ins");
+  },
+
+  async notifyCheckinUpdate(employeeName, managerEmail, quarter) {
+    const link = `${window.location.origin}/?page=checkins`;
+    await this.sendEmail(managerEmail, `Check-in Update: ${quarter}`, `${employeeName} made progress updates.`);
+    await this.sendTeamsCard("Check-in Progress Logged", `**${employeeName}** updated their ${quarter} metrics.`, link, "View Log");
+  },
+
+  async notifyEscalation(toEmail, subject, body, linkPage) {
+    const link = `${window.location.origin}/?page=${linkPage || "escalations"}`;
+    await this.sendEmail(toEmail, subject, body);
+    await this.sendTeamsCard(subject, body, link, "View Escalation");
+  }
+};
+
+// ── Escalation Module (Rule-Based) ─────────────────────────────────────────────
+const ESCALATION_RULES = [
+  {
+    id: "PENDING_APPROVAL_MANAGER",
+    name: "Submitted goals pending 3+ days (manager)",
+    target: "manager",
+    condition: "Goal status is submitted and unchanged for 3+ days",
+    action: "Notify employee's manager",
+    evaluate({ goals, users, openKeys }) {
+      const now = Date.now();
+      const hits = [];
+      for (const g of goals.filter(x => x.status === "submitted")) {
+        const days = (now - new Date(g.updated_at).getTime()) / 86400000;
+        if (days < 3 || days >= 7) continue;
+        const emp = users.find(u => u.id === g.employee_id);
+        if (!emp?.manager_id) continue;
+        const key = `${this.id}:${g.id}:manager`;
+        if (openKeys.has(key)) continue;
+        hits.push({
+          ruleId: this.id,
+          entityType: "goal",
+          entityId: g.id,
+          employeeId: emp.id,
+          targetUserId: emp.manager_id,
+          escalatedTo: "manager",
+          dedupeKey: key,
+          message: `${emp.name}: goals pending approval for ${Math.floor(days)} day(s)`,
+          linkPage: "approvals",
+        });
+      }
+      return hits;
+    },
+  },
+  {
+    id: "PENDING_APPROVAL_ADMIN",
+    name: "Submitted goals pending 7+ days (admin)",
+    target: "admin",
+    condition: "Goal status is submitted and unchanged for 7+ days",
+    action: "Notify HR/admin",
+    evaluate({ goals, users, admins, openKeys }) {
+      const now = Date.now();
+      const hits = [];
+      for (const g of goals.filter(x => x.status === "submitted")) {
+        const days = (now - new Date(g.updated_at).getTime()) / 86400000;
+        if (days < 7) continue;
+        const emp = users.find(u => u.id === g.employee_id);
+        if (!emp || !admins.length) continue;
+        const key = `${this.id}:${g.id}:admin`;
+        if (openKeys.has(key)) continue;
+        hits.push({
+          ruleId: this.id,
+          entityType: "goal",
+          entityId: g.id,
+          employeeId: emp.id,
+          escalatedTo: "admin",
+          dedupeKey: key,
+          notifyAdmins: admins,
+          message: `${emp.name}: goals pending approval for ${Math.floor(days)} day(s) — admin escalation`,
+          linkPage: "overview",
+        });
+      }
+      return hits;
+    },
+  },
+  {
+    id: "MISSING_QUARTER_CHECKIN",
+    name: "No check-in for active quarter",
+    target: "employee",
+    condition: "Locked goals exist but no achievement logged for the active cycle quarter",
+    action: "Notify employee and manager",
+    evaluate({ goals, users, achievements, cycle, openKeys }) {
+      if (!cycle?.phase || cycle.phase === "goal_setting") return [];
+      const quarter = cycle.phase;
+      const hits = [];
+      const byEmployee = {};
+      goals.filter(g => g.status === "locked").forEach(g => {
+        if (!byEmployee[g.employee_id]) byEmployee[g.employee_id] = [];
+        byEmployee[g.employee_id].push(g);
+      });
+      for (const [empId, empGoals] of Object.entries(byEmployee)) {
+        const emp = users.find(u => u.id === empId);
+        if (!emp) continue;
+        const goalIds = empGoals.map(g => g.id);
+        const hasCheckin = achievements.some(a => goalIds.includes(a.goal_id) && a.quarter === quarter);
+        if (hasCheckin) continue;
+
+        const key = `${this.id}:${empId}:employee`;
+        if (openKeys.has(key)) continue;
+        hits.push({
+          ruleId: this.id,
+          entityType: "employee",
+          entityId: empId,
+          employeeId: empId,
+          targetUserId: empId,
+          escalatedTo: "employee",
+          dedupeKey: key,
+          message: `${emp.name}: no ${quarter.toUpperCase()} check-in logged for locked goals`,
+          linkPage: "checkins",
+        });
+
+        if (emp.manager_id) {
+          const mgrKey = `${this.id}:${empId}:manager`;
+          if (!openKeys.has(mgrKey)) {
+            hits.push({
+              ruleId: this.id,
+              entityType: "employee",
+              entityId: empId,
+              employeeId: empId,
+              targetUserId: emp.manager_id,
+              escalatedTo: "manager",
+              dedupeKey: mgrKey,
+              message: `${emp.name}: missing ${quarter.toUpperCase()} check-in on locked goals`,
+              linkPage: "team",
+            });
+          }
+        }
+      }
+      return hits;
+    },
+  },
+];
+
+async function runEscalationCheck() {
+  const [
+    { data: goals },
+    { data: users },
+    { data: achievements },
+    { data: cycle },
+    { data: openEsc },
+  ] = await Promise.all([
+    supabase.from("goals").select("id, employee_id, status, updated_at, title"),
+    supabase.from("users").select("id, name, email, role, manager_id"),
+    supabase.from("achievements").select("goal_id, quarter"),
+    supabase.from("goal_cycles").select("*").eq("is_active", true).maybeSingle(),
+    supabase.from("escalations").select("rule_id, entity_id, employee_id, escalated_to").eq("status", "open"),
+  ]);
+
+  const admins = (users || []).filter(u => u.role === "admin");
+
+  const openKeys = new Set(
+    (openEsc || []).map(e => `${e.rule_id}:${e.entity_id}:${e.escalated_to}`)
+  );
+
+  const ctx = {
+    goals: goals || [],
+    users: users || [],
+    achievements: achievements || [],
+    cycle: cycle || null,
+    admins,
+    openKeys,
+  };
+
+  const hits = ESCALATION_RULES.flatMap(rule => rule.evaluate(ctx));
+  const userById = Object.fromEntries((users || []).map(u => [u.id, u]));
+  let created = 0;
+
+  for (const hit of hits) {
+    const { error } = await supabase.from("escalations").insert({
+      rule_id: hit.ruleId,
+      entity_type: hit.entityType,
+      entity_id: hit.entityId,
+      employee_id: hit.employeeId,
+      escalated_to: hit.escalatedTo,
+      message: hit.message,
+      status: "open",
+    });
+    if (error) continue;
+
+    openKeys.add(hit.dedupeKey);
+
+    const recipients = hit.notifyAdmins || [userById[hit.targetUserId]].filter(Boolean);
+    for (const recipient of recipients) {
+      if (!recipient?.email) continue;
+      await NotificationService.notifyEscalation(
+        recipient.email,
+        `Escalation: ${hit.message}`,
+        hit.message,
+        hit.linkPage
+      );
+    }
+    created++;
+  }
+
+  return created;
+}
+
+// ── Analytics Module ───────────────────────────────────────────────────────────
+function computeAnalytics({ goals, achievements, users, checkins, escalations, cycle }, quarterFilter = "all") {
+  const employees = (users || []).filter(u => u.role === "employee");
+  const goalById = Object.fromEntries((goals || []).map(g => [g.id, g]));
+  const activeQuarter = cycle?.phase && cycle.phase !== "goal_setting" ? cycle.phase : null;
+  const quarter = quarterFilter === "all" ? null : quarterFilter;
+
+  const statusCounts = { draft: 0, submitted: 0, approved: 0, rejected: 0, locked: 0 };
+  (goals || []).forEach(g => { if (statusCounts[g.status] !== undefined) statusCounts[g.status]++; });
+
+  function employeeWeightedScore(empId, q) {
+    const empGoals = (goals || []).filter(g => g.employee_id === empId && g.status === "locked");
+    let wSum = 0;
+    let wTotal = 0;
+    empGoals.forEach(g => {
+      const ach = (achievements || []).find(a => a.goal_id === g.id && a.quarter === q && a.score != null);
+      if (ach) {
+        const w = parseFloat(g.weightage) || 0;
+        wSum += parseFloat(ach.score) * w;
+        wTotal += w;
+      }
+    });
+    return wTotal > 0 ? wSum / wTotal : null;
+  }
+
+  const quarterAvgs = {};
+  ["q1", "q2", "q3", "q4"].forEach(q => {
+    const scores = (achievements || [])
+      .filter(a => a.quarter === q && a.score != null && goalById[a.goal_id])
+      .map(a => parseFloat(a.score));
+    quarterAvgs[q] = scores.length ? scores.reduce((s, n) => s + n, 0) / scores.length : null;
+  });
+
+  const progressCounts = { not_started: 0, on_track: 0, completed: 0 };
+  const progressAch = quarter
+    ? (achievements || []).filter(a => a.quarter === quarter)
+    : achievements || [];
+  progressAch.forEach(a => {
+    if (progressCounts[a.progress_status] !== undefined) progressCounts[a.progress_status]++;
+  });
+
+  const leaderboard = employees
+    .map(emp => {
+      const q = quarter || activeQuarter;
+      const score = q ? employeeWeightedScore(emp.id, q) : null;
+      const anyScores = ["q1", "q2", "q3", "q4"]
+        .map(qu => ({ qu, score: employeeWeightedScore(emp.id, qu) }))
+        .filter(x => x.score != null);
+      const fallback = anyScores.length ? anyScores[anyScores.length - 1] : null;
+      return {
+        id: emp.id,
+        name: emp.name,
+        department: emp.department || "—",
+        score: score ?? fallback?.score ?? null,
+        usedQuarter: q || fallback?.qu,
+        lockedCount: (goals || []).filter(g => g.employee_id === emp.id && g.status === "locked").length,
+      };
+    })
+    .filter(e => e.score != null)
+    .sort((a, b) => b.score - a.score);
+
+  const deptMap = {};
+  employees.forEach(emp => {
+    const dept = emp.department || "Unassigned";
+    if (!deptMap[dept]) deptMap[dept] = { employees: 0, goals: 0, locked: 0, scores: [] };
+    deptMap[dept].employees++;
+    const empGoals = (goals || []).filter(g => g.employee_id === emp.id);
+    deptMap[dept].goals += empGoals.length;
+    deptMap[dept].locked += empGoals.filter(g => g.status === "locked").length;
+    const q = quarter || activeQuarter;
+    if (q) {
+      const sc = employeeWeightedScore(emp.id, q);
+      if (sc != null) deptMap[dept].scores.push(sc);
+    }
+  });
+  const departments = Object.entries(deptMap)
+    .map(([name, d]) => ({
+      name,
+      employees: d.employees,
+      goals: d.goals,
+      lockRate: d.goals > 0 ? Math.round((d.locked / d.goals) * 100) : 0,
+      avgScore: d.scores.length ? d.scores.reduce((s, n) => s + n, 0) / d.scores.length : null,
+    }))
+    .sort((a, b) => b.goals - a.goals);
+
+  const thrustMap = {};
+  (goals || []).forEach(g => {
+    if (!thrustMap[g.thrust_area]) thrustMap[g.thrust_area] = { count: 0, scores: [] };
+    thrustMap[g.thrust_area].count++;
+  });
+  (achievements || []).forEach(a => {
+    const g = goalById[a.goal_id];
+    if (g && a.score != null) {
+      if (!thrustMap[g.thrust_area]) thrustMap[g.thrust_area] = { count: 0, scores: [] };
+      if (!quarter || a.quarter === quarter) thrustMap[g.thrust_area].scores.push(parseFloat(a.score));
+    }
+  });
+  const thrustAreas = Object.entries(thrustMap)
+    .map(([name, d]) => ({
+      name,
+      count: d.count,
+      avgScore: d.scores.length ? d.scores.reduce((s, n) => s + n, 0) / d.scores.length : null,
+    }))
+    .sort((a, b) => b.count - a.count);
+
+  const employeesWithLocked = employees.filter(e =>
+    (goals || []).some(g => g.employee_id === e.id && g.status === "locked")
+  ).length;
+
+  const checkinEmps = { q1: new Set(), q2: new Set(), q3: new Set(), q4: new Set() };
+  (checkins || []).forEach(c => checkinEmps[c.quarter]?.add(c.employee_id));
+  const checkinRates = Object.fromEntries(
+    ["q1", "q2", "q3", "q4"].map(q => [
+      q,
+      employees.length ? Math.round((checkinEmps[q].size / employees.length) * 100) : 0,
+    ])
+  );
+
+  const scoredAch = (achievements || []).filter(a => {
+    if (a.score == null || !goalById[a.goal_id]) return false;
+    return !quarter || a.quarter === quarter;
+  });
+  const overallAvgScore = scoredAch.length
+    ? scoredAch.reduce((s, a) => s + parseFloat(a.score), 0) / scoredAch.length
+    : null;
+
+  const openEscalations = (escalations || []).filter(e => e.status === "open").length;
+  const selectedQuarterAvg = quarter ? quarterAvgs[quarter] : null;
+
+  return {
+    cycle,
+    activeQuarter,
+    quarter,
+    statusCounts,
+    quarterAvgs,
+    progressCounts,
+    departments,
+    thrustAreas,
+    leaderboard,
+    checkinRates,
+    kpis: {
+      totalGoals: (goals || []).length,
+      totalEmployees: employees.length,
+      overallAvgScore,
+      selectedQuarterAvg,
+      goalLockRate: employees.length ? Math.round((employeesWithLocked / employees.length) * 100) : 0,
+      pendingApprovals: statusCounts.submitted,
+      openEscalations,
+    },
+  };
+}
+
+function AnalyticsBar({ label, value, max, color = "#6366f1", suffix = "" }) {
+  const pct = max > 0 ? Math.min((value / max) * 100, 100) : 0;
+  return (
+    <div style={{ marginBottom: 12 }}>
+      <div style={{ display: "flex", justifyContent: "space-between", fontSize: 12, marginBottom: 4 }}>
+        <span style={{ color: "#94a3b8" }}>{label}</span>
+        <span style={{ color: "#f1f5f9", fontWeight: 600 }}>{value}{suffix}</span>
+      </div>
+      <div style={{ background: "#1e293b", borderRadius: 4, height: 8 }}>
+        <div style={{ width: `${pct}%`, height: "100%", background: color, borderRadius: 4, transition: "width 0.4s" }} />
+      </div>
+    </div>
+  );
+}
+
 // ── Auth Context ───────────────────────────────────────────────────────────────
 const AuthContext = createContext(null);
 
@@ -161,8 +580,9 @@ function LoginPage({ onLogin }) {
   async function handleSSOLogin() {
     setLoading(true); setError("");
     try {
-      const loginResponse = await msalInstance.loginPopup({ scopes: ["User.Read"] });
+      const loginResponse = await msalInstance.loginPopup({ scopes: ["User.Read", "User.ReadBasic.All"] });
       const idToken = loginResponse.idToken;
+      const accessToken = loginResponse.accessToken;
       const decoded = jwtDecode(idToken);
       
       const userEmail = loginResponse.account.username;
@@ -174,9 +594,32 @@ function LoginPage({ onLogin }) {
         else if (decoded.roles.includes("ManagerGroup")) role = "manager";
       }
 
+      // Fetch Organizational Hierarchy (The user's Manager) from Microsoft Graph
+      let managerId = null;
+      try {
+        const graphRes = await fetch("https://graph.microsoft.com/v1.0/me/manager", {
+          headers: { Authorization: `Bearer ${accessToken}` }
+        });
+        if (graphRes.ok) {
+          const managerData = await graphRes.json();
+          const managerEmail = managerData.mail || managerData.userPrincipalName;
+          
+          // Look up the manager in your Supabase DB to get their internal ID
+          const { data: managerRecord } = await supabase
+            .from("users")
+            .select("id")
+            .eq("email", managerEmail.trim())
+            .single();
+            
+          if (managerRecord) {
+            managerId = managerRecord.id;
+          }
+        }
+      } catch (err) {
+        console.warn("No manager found in Active Directory for this user.");
+      }
+
       // Sync User Data to Supabase User Table to keep Hierarchy and DB relationships robust
-      // Typically Azure claims have "manager" attribute if you query Graph API. 
-      // For standard sync, we're assigning based on DB lookup / Upsert
       let { data, error: dbError } = await supabase.from("users").select("*").eq("email", userEmail.trim()).single();
       
       if (!data) {
@@ -186,10 +629,17 @@ function LoginPage({ onLogin }) {
           email: userEmail,
           name: name,
           role: role,
+          manager_id: managerId,
           id: loginResponse.account.localAccountId // use Azure ID as UUID mapping
         }).select().single();
         if (res.error) throw res.error;
         data = res.data;
+      } else {
+        // Update existing user's manager and role in case it changed in Azure AD
+        await supabase.from("users").update({ manager_id: managerId, role: role }).eq("id", data.id);
+        // Refresh local data copy with latest updates
+        data.manager_id = managerId;
+        data.role = role;
       }
 
       onLogin(data);
@@ -298,6 +748,8 @@ function Layout({ user, onLogout, page, setPage, children }) {
     ],
     admin: [
       { id: "overview",   label: "Overview",       icon: "📊" },
+      { id: "analytics",  label: "Analytics",      icon: "📉" },
+      { id: "escalations", label: "Escalations",   icon: "🚨" },
       { id: "cycles",     label: "Cycles",         icon: "📅" },
       { id: "audit",      label: "Audit Log",      icon: "🔍" },
       { id: "reports",    label: "Reports",        icon: "📈" },
@@ -417,12 +869,22 @@ function MyGoalsPage({ user, toast }) {
   const isLocked = activeGoals.length > 0 && activeGoals.every(g => g.status === "locked");
 
   async function submitGoals() {
-    if (Math.abs(totalWeightage - 100) > 0.01) { toast.error("Total weightage must equal 100%"); return; }
-    const draftIds = goals.filter(g => g.status === "draft").map(g => g.id);
+    if (!isGoalSettingOpen()) { toast.error("Goal Setting window is closed."); return; }
+    if (totalWeightage !== 100) { toast.error(`Total weightage must be exactly 100%. Currently ${totalWeightage}%`); return; }
+    const res = confirm("Submit goals for approval? They will be locked from further edits.");
+    if (!res) return;
+    
+    const draftIds = activeGoals.map(g => g.id);
     await supabase.from("goals").update({ status: "submitted" }).in("id", draftIds);
     await supabase.from("audit_log").insert(draftIds.map(id => ({ goal_id: id, changed_by: user.id, action: "submitted" })));
-    toast.success("Goals submitted for approval!");
+    toast.success("Goals submitted for approval");
     fetch();
+
+    // Notification Trigger
+    const { data: userData } = await supabase.from("users").select("manager:manager_id(id,email)").eq("id", user.id).single();
+    if (userData?.manager?.email) {
+      NotificationService.notifySubmission(user.name, userData.manager.email, user.id);
+    }
   }
 
   async function deleteGoal(id) {
@@ -688,6 +1150,14 @@ function EmployeeCheckinsPage({ user, toast }) {
     }
     setAchievements(p => ({ ...p, [goal.id]: { ...p[goal.id], [quarter]: { ...(p[goal.id]?.[quarter] || {}), progress_status: status } } }));
     toast.success("Status updated");
+
+    // Notification Trigger (only notify if manager is present in checkins data)
+    if (myCheckins[0]?.manager?.email || user) {
+      const { data: userData } = await supabase.from("users").select("manager:manager_id(email)").eq("id", user.id).single();
+      if (userData?.manager?.email) {
+        NotificationService.notifyCheckinUpdate(user.name, userData.manager.email, quarter.toUpperCase());
+      }
+    }
   }
 
   return (
@@ -823,18 +1293,28 @@ function ApprovalsPage({ user, toast }) {
     await supabase.from("goals").update({ status: "locked" }).in("id", ids);
     await supabase.from("audit_log").insert(ids.map(id => ({ goal_id: id, changed_by: user.id, action: "approved_and_locked" })));
     toast.success("Goals approved and locked!");
+    
+    // Notification Trigger
+    const employeeEmail = submissions.find(s => s.goals[0].employee_id === employeeId)?.employee?.email;
+    if (employeeEmail) NotificationService.notifyApproval(employeeEmail);
+
     fetch();
   }
 
-  async function returnForRework(employee_id) {
+  async function returnForRework(employeeId) {
     if (!isGoalSettingOpen()) { toast.error("Goal setting window is closed"); return; }
     const res = confirm("Return these goals back to draft state? This will erase any existing actuals for this quarter.");
     if (!res) return;
-    const empGoals = submissions.find(s => s.goals[0].employee_id === employee_id)?.goals || [];
+    const empGoals = submissions.find(s => s.goals[0].employee_id === employeeId)?.goals || [];
     const ids = empGoals.filter(g => g.status === "submitted").map(g => g.id);
     await supabase.from("goals").update({ status: "draft" }).in("id", ids);
     await supabase.from("audit_log").insert(ids.map(id => ({ goal_id: id, changed_by: user.id, action: "returned_for_rework" })));
     toast.warn("Goals returned for rework");
+    
+    // Notification Trigger
+    const employeeEmail = submissions.find(s => s.goals[0].employee_id === employeeId)?.employee?.email;
+    if (employeeEmail) NotificationService.notifyRework(employeeEmail);
+
     fetch();
   }
 
@@ -959,6 +1439,16 @@ function TeamDashboardPage({ user, toast }) {
     supabase.from("users").select("*").eq("manager_id", user.id).then(({ data }) => setTeam(data || []));
   }, [user.id]);
 
+  async function sendReminders() {
+    if (!team.length) return;
+    toast.success("Sending automated reminders to team...");
+    for (const member of team) {
+      if (member.email) {
+        await NotificationService.notifyCheckinReminder(member.email, member.name, quarter.toUpperCase());
+      }
+    }
+  }
+
   useEffect(() => {
     if (!selected) return;
     (async () => {
@@ -971,8 +1461,12 @@ function TeamDashboardPage({ user, toast }) {
 
   return (
     <div>
-      <PageHeader title="Team Dashboard" subtitle="Monitor your team's goal progress" />
-      <div style={{ display: "grid", gridTemplateColumns: "220px 1fr", gap: 20 }}>
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+        <PageHeader title="Team Dashboard" subtitle="Monitor your team's goal progress and check-ins" />
+        <Btn onClick={sendReminders} style={{ background: "linear-gradient(to right, #f59e0b, #d97706)" }}>🔔 Send Check-in Reminders</Btn>
+      </div>
+      
+      <div style={{ display: "grid", gridTemplateColumns: "1fr 2.5fr", gap: 24 }}>
         {/* Team list */}
         <div>
           {team.map(member => (
@@ -1374,6 +1868,330 @@ function AuditLogPage() {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
+// ADMIN — ANALYTICS MODULE
+// ═══════════════════════════════════════════════════════════════════════════════
+function AnalyticsPage() {
+  const [data, setData] = useState(null);
+  const [loading, setLoading] = useState(true);
+  const [quarterFilter, setQuarterFilter] = useState("all");
+
+  const load = useCallback(async () => {
+    setLoading(true);
+    const [
+      { data: goals },
+      { data: achievements },
+      { data: users },
+      { data: checkins },
+      escRes,
+      { data: cycle },
+    ] = await Promise.all([
+      supabase.from("goals").select("*"),
+      supabase.from("achievements").select("*"),
+      supabase.from("users").select("*"),
+      supabase.from("checkins").select("*"),
+      supabase.from("escalations").select("*"),
+      supabase.from("goal_cycles").select("*").eq("is_active", true).maybeSingle(),
+    ]);
+    const escalations = escRes.error ? [] : escRes.data;
+    setData(computeAnalytics(
+      { goals, achievements, users, checkins, escalations, cycle },
+      quarterFilter
+    ));
+    setLoading(false);
+  }, [quarterFilter]);
+
+  useEffect(() => { load(); }, [load]);
+
+  if (loading || !data) return <div style={{ color: "#64748b" }}>Loading analytics…</div>;
+
+  const { kpis, statusCounts, quarterAvgs, progressCounts, departments, thrustAreas, leaderboard, checkinRates, cycle, activeQuarter } = data;
+  const statusTotal = Object.values(statusCounts).reduce((s, n) => s + n, 0);
+  const progressTotal = Object.values(progressCounts).reduce((s, n) => s + n, 0);
+  const maxQuarterAvg = Math.max(...Object.values(quarterAvgs).filter(v => v != null), 1);
+
+  const fmt = n => (n != null ? `${n.toFixed(1)}%` : "—");
+
+  return (
+    <div>
+      <PageHeader
+        title="Analytics Module"
+        subtitle={cycle ? `${cycle.name} • ${cycle.phase.replace(/_/g, " ").toUpperCase()}` : "Organization performance insights"}
+        action={
+          <select value={quarterFilter} onChange={e => setQuarterFilter(e.target.value)} style={{ ...inputStyle, width: 140 }}>
+            <option value="all">All quarters</option>
+            {["q1", "q2", "q3", "q4"].map(q => <option key={q} value={q}>{q.toUpperCase()}</option>)}
+          </select>
+        }
+      />
+
+      <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(150px, 1fr))", gap: 14, marginBottom: 24 }}>
+        {[
+          { label: "Avg Achievement Score", value: fmt(quarterFilter !== "all" ? kpis.selectedQuarterAvg : kpis.overallAvgScore), color: "#60a5fa", icon: "📈" },
+          { label: "Employees w/ Locked Goals", value: `${kpis.goalLockRate}%`, color: "#10b981", icon: "🔒" },
+          { label: "Pending Approvals", value: kpis.pendingApprovals, color: "#f59e0b", icon: "⏳" },
+          { label: "Open Escalations", value: kpis.openEscalations, color: "#ef4444", icon: "🚨" },
+          { label: "Total Goals", value: kpis.totalGoals, color: "#6366f1", icon: "🎯" },
+        ].map(s => (
+          <div key={s.label} style={{ background: "#0f172a", border: "1px solid #1e293b", borderRadius: 12, padding: 18 }}>
+            <div style={{ fontSize: 22, marginBottom: 4 }}>{s.icon}</div>
+            <div style={{ fontSize: 24, fontWeight: 800, color: s.color, fontFamily: "'Syne', sans-serif" }}>{s.value}</div>
+            <div style={{ fontSize: 11, color: "#64748b", marginTop: 4 }}>{s.label}</div>
+          </div>
+        ))}
+      </div>
+
+      <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 20, marginBottom: 24 }}>
+        <div style={{ background: "#0f172a", border: "1px solid #1e293b", borderRadius: 14, padding: 20 }}>
+          <h3 style={{ margin: "0 0 16px", fontSize: 15, fontWeight: 700, color: "#60a5fa" }}>Goal Status Distribution</h3>
+          {Object.entries(statusCounts).map(([status, count]) => (
+            <AnalyticsBar key={status} label={status.replace(/_/g, " ")} value={count} max={statusTotal || 1} color={
+              status === "locked" ? "#6366f1" : status === "submitted" ? "#f59e0b" : status === "draft" ? "#94a3b8" : status === "approved" ? "#10b981" : "#ef4444"
+            } />
+          ))}
+        </div>
+
+        <div style={{ background: "#0f172a", border: "1px solid #1e293b", borderRadius: 14, padding: 20 }}>
+          <h3 style={{ margin: "0 0 16px", fontSize: 15, fontWeight: 700, color: "#60a5fa" }}>
+            Quarterly Avg Scores{activeQuarter && quarterFilter === "all" ? ` (active: ${activeQuarter.toUpperCase()})` : ""}
+          </h3>
+          {["q1", "q2", "q3", "q4"].map(q => (
+            <AnalyticsBar
+              key={q}
+              label={q.toUpperCase()}
+              value={quarterAvgs[q] != null ? quarterAvgs[q].toFixed(1) : 0}
+              max={maxQuarterAvg}
+              color={q === activeQuarter ? "#60a5fa" : "#6366f1"}
+              suffix={quarterAvgs[q] != null ? "%" : " (no data)"}
+            />
+          ))}
+        </div>
+      </div>
+
+      <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 20, marginBottom: 24 }}>
+        <div style={{ background: "#0f172a", border: "1px solid #1e293b", borderRadius: 14, padding: 20 }}>
+          <h3 style={{ margin: "0 0 16px", fontSize: 15, fontWeight: 700, color: "#60a5fa" }}>Check-in Participation</h3>
+          {["q1", "q2", "q3", "q4"].map(q => (
+            <AnalyticsBar key={q} label={`${q.toUpperCase()} employees with check-ins`} value={checkinRates[q]} max={100} color="#06b6d4" suffix="%" />
+          ))}
+        </div>
+
+        <div style={{ background: "#0f172a", border: "1px solid #1e293b", borderRadius: 14, padding: 20 }}>
+          <h3 style={{ margin: "0 0 16px", fontSize: 15, fontWeight: 700, color: "#60a5fa" }}>Progress Status{quarterFilter !== "all" ? ` (${quarterFilter.toUpperCase()})` : ""}</h3>
+          {Object.entries(progressCounts).map(([status, count]) => (
+            <AnalyticsBar
+              key={status}
+              label={status.replace(/_/g, " ")}
+              value={count}
+              max={progressTotal || 1}
+              color={status === "completed" ? "#10b981" : status === "on_track" ? "#f59e0b" : "#94a3b8"}
+            />
+          ))}
+          {progressTotal === 0 && <div style={{ color: "#64748b", fontSize: 13 }}>No achievement records for this filter.</div>}
+        </div>
+      </div>
+
+      <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 20, marginBottom: 24 }}>
+        <div style={{ background: "#0f172a", border: "1px solid #1e293b", borderRadius: 14, overflow: "hidden" }}>
+          <div style={{ padding: "16px 20px", borderBottom: "1px solid #1e293b" }}>
+            <h3 style={{ margin: 0, fontSize: 15, fontWeight: 700, color: "#60a5fa" }}>By Department</h3>
+          </div>
+          <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 13 }}>
+            <thead>
+              <tr style={{ borderBottom: "1px solid #1e293b", background: "#1e293b" }}>
+                {["Department", "Employees", "Goals", "Locked %", "Avg Score"].map(h => (
+                  <th key={h} style={{ padding: "10px 14px", textAlign: "left", color: "#64748b", fontSize: 11, textTransform: "uppercase" }}>{h}</th>
+                ))}
+              </tr>
+            </thead>
+            <tbody>
+              {departments.length === 0 ? (
+                <tr><td colSpan={5} style={{ padding: 24, textAlign: "center", color: "#64748b" }}>No department data</td></tr>
+              ) : departments.map(d => (
+                <tr key={d.name} style={{ borderBottom: "1px solid #0f172a" }}>
+                  <td style={{ padding: "10px 14px", color: "#f1f5f9", fontWeight: 600 }}>{d.name}</td>
+                  <td style={{ padding: "10px 14px", color: "#94a3b8" }}>{d.employees}</td>
+                  <td style={{ padding: "10px 14px", color: "#94a3b8" }}>{d.goals}</td>
+                  <td style={{ padding: "10px 14px", color: "#6366f1" }}>{d.lockRate}%</td>
+                  <td style={{ padding: "10px 14px", color: "#10b981" }}>{fmt(d.avgScore)}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+
+        <div style={{ background: "#0f172a", border: "1px solid #1e293b", borderRadius: 14, overflow: "hidden" }}>
+          <div style={{ padding: "16px 20px", borderBottom: "1px solid #1e293b" }}>
+            <h3 style={{ margin: 0, fontSize: 15, fontWeight: 700, color: "#60a5fa" }}>By Thrust Area</h3>
+          </div>
+          <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 13 }}>
+            <thead>
+              <tr style={{ borderBottom: "1px solid #1e293b", background: "#1e293b" }}>
+                {["Thrust Area", "Goals", "Avg Score"].map(h => (
+                  <th key={h} style={{ padding: "10px 14px", textAlign: "left", color: "#64748b", fontSize: 11, textTransform: "uppercase" }}>{h}</th>
+                ))}
+              </tr>
+            </thead>
+            <tbody>
+              {thrustAreas.length === 0 ? (
+                <tr><td colSpan={3} style={{ padding: 24, textAlign: "center", color: "#64748b" }}>No goals yet</td></tr>
+              ) : thrustAreas.slice(0, 8).map(t => (
+                <tr key={t.name} style={{ borderBottom: "1px solid #0f172a" }}>
+                  <td style={{ padding: "10px 14px", color: "#f1f5f9" }}>{t.name}</td>
+                  <td style={{ padding: "10px 14px", color: "#94a3b8" }}>{t.count}</td>
+                  <td style={{ padding: "10px 14px", color: "#10b981" }}>{fmt(t.avgScore)}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      </div>
+
+      <div style={{ background: "#0f172a", border: "1px solid #1e293b", borderRadius: 14, overflow: "hidden" }}>
+        <div style={{ padding: "16px 20px", borderBottom: "1px solid #1e293b" }}>
+          <h3 style={{ margin: 0, fontSize: 15, fontWeight: 700, color: "#60a5fa" }}>Employee Performance (weighted by goal weightage)</h3>
+        </div>
+        <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 13 }}>
+          <thead>
+            <tr style={{ borderBottom: "1px solid #1e293b", background: "#1e293b" }}>
+              {["Rank", "Employee", "Department", "Locked Goals", "Weighted Score", "Quarter"].map(h => (
+                <th key={h} style={{ padding: "10px 16px", textAlign: "left", color: "#64748b", fontSize: 11, textTransform: "uppercase" }}>{h}</th>
+              ))}
+            </tr>
+          </thead>
+          <tbody>
+            {leaderboard.length === 0 ? (
+              <tr><td colSpan={6} style={{ padding: 40, textAlign: "center", color: "#64748b" }}>No scored achievements yet. Log check-ins with actuals to populate analytics.</td></tr>
+            ) : (
+              leaderboard.map((emp, i) => (
+                <tr key={emp.id} style={{ borderBottom: "1px solid #0f172a" }}>
+                  <td style={{ padding: "10px 16px", color: "#64748b" }}>#{i + 1}</td>
+                  <td style={{ padding: "10px 16px", color: "#f1f5f9", fontWeight: 600 }}>{emp.name}</td>
+                  <td style={{ padding: "10px 16px", color: "#94a3b8" }}>{emp.department}</td>
+                  <td style={{ padding: "10px 16px", color: "#94a3b8" }}>{emp.lockedCount}</td>
+                  <td style={{ padding: "10px 16px" }}><ScoreBar score={emp.score?.toFixed(1)} /></td>
+                  <td style={{ padding: "10px 16px", color: "#64748b" }}>{emp.usedQuarter?.toUpperCase() || "—"}</td>
+                </tr>
+              ))
+            )}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  );
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// ADMIN — ESCALATION MODULE (RULE-BASED)
+// ═══════════════════════════════════════════════════════════════════════════════
+function EscalationPage({ toast }) {
+  const [logs, setLogs] = useState([]);
+  const [running, setRunning] = useState(false);
+
+  const loadLogs = useCallback(async () => {
+    const { data } = await supabase
+      .from("escalations")
+      .select("*, employee:employee_id(name)")
+      .order("created_at", { ascending: false })
+      .limit(50);
+    setLogs(data || []);
+  }, []);
+
+  useEffect(() => { loadLogs(); }, [loadLogs]);
+
+  async function runCheck() {
+    setRunning(true);
+    try {
+      const created = await runEscalationCheck();
+      await loadLogs();
+      toast.success(created > 0 ? `${created} escalation(s) triggered` : "No new escalations — all rules passed");
+    } catch (err) {
+      console.error(err);
+      toast.error("Escalation check failed. Ensure the escalations table exists in Supabase.");
+    }
+    setRunning(false);
+  }
+
+  async function resolve(id) {
+    await supabase.from("escalations").update({ status: "resolved" }).eq("id", id);
+    toast.success("Escalation resolved");
+    loadLogs();
+  }
+
+  const ruleLabel = id => ESCALATION_RULES.find(r => r.id === id)?.name || id;
+
+  return (
+    <div>
+      <PageHeader
+        title="Escalation Module (Rule-Based)"
+        subtitle="Automatically escalates overdue approvals and missing check-ins"
+        action={<Btn onClick={runCheck} disabled={running}>{running ? "Running…" : "▶ Run Escalation Check"}</Btn>}
+      />
+
+      <div style={{ background: "#0f172a", border: "1px solid #1e293b", borderRadius: 14, overflow: "hidden", marginBottom: 24 }}>
+        <div style={{ padding: "16px 20px", borderBottom: "1px solid #1e293b" }}>
+          <h3 style={{ margin: 0, fontSize: 16, fontWeight: 700, color: "#60a5fa" }}>Active Rules</h3>
+        </div>
+        <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 13 }}>
+          <thead>
+            <tr style={{ borderBottom: "1px solid #1e293b", background: "#1e293b" }}>
+              {["Rule", "Condition", "Action", "Escalate To"].map(h => (
+                <th key={h} style={{ padding: "10px 16px", textAlign: "left", color: "#64748b", fontWeight: 600, fontSize: 11, textTransform: "uppercase" }}>{h}</th>
+              ))}
+            </tr>
+          </thead>
+          <tbody>
+            {ESCALATION_RULES.map(rule => (
+              <tr key={rule.id} style={{ borderBottom: "1px solid #0f172a" }}>
+                <td style={{ padding: "10px 16px", color: "#f1f5f9", fontWeight: 600 }}>{rule.name}</td>
+                <td style={{ padding: "10px 16px", color: "#94a3b8" }}>{rule.condition}</td>
+                <td style={{ padding: "10px 16px", color: "#94a3b8" }}>{rule.action}</td>
+                <td style={{ padding: "10px 16px" }}><Badge status={rule.target === "manager" ? "submitted" : rule.target === "admin" ? "locked" : "on_track"} /> <span style={{ color: "#64748b", fontSize: 11, marginLeft: 6 }}>{rule.target}</span></td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+
+      <div style={{ background: "#0f172a", border: "1px solid #1e293b", borderRadius: 14, overflow: "hidden" }}>
+        <div style={{ padding: "16px 20px", borderBottom: "1px solid #1e293b" }}>
+          <h3 style={{ margin: 0, fontSize: 16, fontWeight: 700, color: "#94a3b8" }}>Escalation Log</h3>
+        </div>
+        <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 13 }}>
+          <thead>
+            <tr style={{ borderBottom: "1px solid #1e293b", background: "#1e293b" }}>
+              {["When", "Rule", "Employee", "Message", "To", "Status", ""].map(h => (
+                <th key={h || "act"} style={{ padding: "10px 16px", textAlign: "left", color: "#64748b", fontWeight: 600, fontSize: 11, textTransform: "uppercase" }}>{h}</th>
+              ))}
+            </tr>
+          </thead>
+          <tbody>
+            {logs.length === 0 ? (
+              <tr><td colSpan={7} style={{ padding: 40, textAlign: "center", color: "#64748b" }}>No escalations yet. Run a check to evaluate rules.</td></tr>
+            ) : (
+              logs.map(log => (
+                <tr key={log.id} style={{ borderBottom: "1px solid #0f172a" }}>
+                  <td style={{ padding: "10px 16px", color: "#94a3b8" }}>{new Date(log.created_at).toLocaleString()}</td>
+                  <td style={{ padding: "10px 16px", color: "#60a5fa", fontSize: 12 }}>{ruleLabel(log.rule_id)}</td>
+                  <td style={{ padding: "10px 16px", color: "#f1f5f9" }}>{log.employee?.name || "—"}</td>
+                  <td style={{ padding: "10px 16px", color: "#cbd5e1" }}>{log.message}</td>
+                  <td style={{ padding: "10px 16px", color: "#64748b", textTransform: "capitalize" }}>{log.escalated_to}</td>
+                  <td style={{ padding: "10px 16px" }}><Badge status={log.status === "open" ? "rejected" : "approved"} /></td>
+                  <td style={{ padding: "10px 16px" }}>
+                    {log.status === "open" && (
+                      <Btn onClick={() => resolve(log.id)} variant="ghost" style={{ padding: "4px 8px", fontSize: 11 }}>Resolve</Btn>
+                    )}
+                  </td>
+                </tr>
+              ))
+            )}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  );
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
 // ROOT APP
 // ═══════════════════════════════════════════════════════════════════════════════
 export default function App() {
@@ -1387,7 +2205,17 @@ export default function App() {
   };
   const [page, setPage] = useState("my-goals");
 
-  function handleLogin(u) { setUser(u); setPage(defaultPage[u.role]); }
+  function handleLogin(u) {
+    setUser(u);
+    // Deep Linking Support
+    const params = new URLSearchParams(window.location.search);
+    const deepLinkPage = params.get("page");
+    if (deepLinkPage) {
+      setPage(deepLinkPage);
+    } else {
+      setPage(defaultPage[u.role]);
+    }
+  }
   function handleLogout() { setUser(null); }
 
   if (!user) return (
@@ -1410,6 +2238,8 @@ export default function App() {
     }
     if (user.role === "admin") {
       if (page === "overview") return <AdminOverviewPage user={user} toast={toast} />;
+      if (page === "analytics") return <AnalyticsPage />;
+      if (page === "escalations") return <EscalationPage toast={toast} />;
       if (page === "cycles")   return <CyclesPage toast={toast} />;
       if (page === "audit")    return <AuditLogPage />;
       if (page === "reports")  return <ReportsPage toast={toast} />;
