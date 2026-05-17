@@ -1,10 +1,24 @@
 import { useState, useEffect, createContext, useContext, useCallback } from "react";
 import { createClient } from "@supabase/supabase-js";
+import { PublicClientApplication } from "@azure/msal-browser";
+import { jwtDecode } from "jwt-decode";
 
 // ── Supabase client ────────────────────────────────────────────────────────────
 const SUPABASE_URL = "https://qbzfxgalwnktrnjkuxjs.supabase.co";
 const SUPABASE_ANON_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InFiemZ4Z2Fsd25rdHJuamt1eGpzIiwicm9sZSI6ImFub24iLCJpYXQiOjE3Nzg4NjgwODYsImV4cCI6MjA5NDQ0NDA4Nn0.5tmA8hy5pvYAo72udbwjGxgik0RZ8ziuHFLW0u7Zqug";
 const supabase = createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
+
+// ── MSAL Configuration ────────────────────────────────────────────────────────
+const msalConfig = {
+  auth: {
+    clientId: "YOUR_AZURE_CLIENT_ID", // Replace with your actual Azure AD Client ID
+    authority: "https://login.microsoftonline.com/YOUR_TENANT_ID", // Replace with your Tenant ID
+    redirectUri: window.location.origin
+  }
+};
+const msalInstance = new PublicClientApplication(msalConfig);
+// Init MSAL instance asynchronously
+msalInstance.initialize().catch(()=>console.log("MSAL Init Error"));
 
 // ── Auth Context ───────────────────────────────────────────────────────────────
 const AuthContext = createContext(null);
@@ -144,6 +158,49 @@ function LoginPage({ onLogin }) {
     { email: "admin@demo.com",    label: "Admin/HR", icon: "🛡", color: "#f59e0b" },
   ];
 
+  async function handleSSOLogin() {
+    setLoading(true); setError("");
+    try {
+      const loginResponse = await msalInstance.loginPopup({ scopes: ["User.Read"] });
+      const idToken = loginResponse.idToken;
+      const decoded = jwtDecode(idToken);
+      
+      const userEmail = loginResponse.account.username;
+      
+      // Determine Role based on Azure AD Groups (Roles returned in decoded token if configured on Azure side)
+      let role = "employee"; // Default fallback
+      if (decoded.roles) {
+        if (decoded.roles.includes("AdminGroup")) role = "admin";
+        else if (decoded.roles.includes("ManagerGroup")) role = "manager";
+      }
+
+      // Sync User Data to Supabase User Table to keep Hierarchy and DB relationships robust
+      // Typically Azure claims have "manager" attribute if you query Graph API. 
+      // For standard sync, we're assigning based on DB lookup / Upsert
+      let { data, error: dbError } = await supabase.from("users").select("*").eq("email", userEmail.trim()).single();
+      
+      if (!data) {
+        // Automatically provision via AD Sync if they don't exist
+        const name = loginResponse.account.name || userEmail.split("@")[0];
+        const res = await supabase.from("users").insert({
+          email: userEmail,
+          name: name,
+          role: role,
+          id: loginResponse.account.localAccountId // use Azure ID as UUID mapping
+        }).select().single();
+        if (res.error) throw res.error;
+        data = res.data;
+      }
+
+      onLogin(data);
+    } catch (err) {
+      console.error(err);
+      setError("SSO Login failed. Verify Configuration.");
+    } finally {
+      setLoading(false);
+    }
+  }
+
   async function handleLogin(e) {
     e.preventDefault();
     setLoading(true); setError("");
@@ -154,48 +211,66 @@ function LoginPage({ onLogin }) {
   }
 
   return (
-    <div style={{ minHeight: "100vh", background: "#060e1e", display: "flex", alignItems: "center", justifyContent: "center", fontFamily: "'DM Mono', 'Courier New', monospace" }}>
+    <div style={{ minHeight: "100vh", background: "linear-gradient(135deg, #0f172a 0%, #020617 100%)", display: "flex", alignItems: "center", justifyContent: "center", fontFamily: "'DM Mono', 'Courier New', monospace" }}>
       <style>{`
-        @import url('https://fonts.googleapis.com/css2?family=DM+Mono:wght@400;500&family=Syne:wght@700;800&display=swap');
+        @import url('https://fonts.googleapis.com/css2?family=DM+Mono:wght@400;500&family=Syne:wght@700;800&family=Inter:wght@400;500;600;700&display=swap');
         * { box-sizing: border-box; }
+        body { font-family: 'Inter', sans-serif; }
         @keyframes slideIn { from { transform: translateX(30px); opacity: 0; } to { transform: translateX(0); opacity: 1; } }
         @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:0.6} }
+        @keyframes glow { 0%,100%{box-shadow: 0 0 15px rgba(99, 102, 241, 0.4);} 50%{box-shadow: 0 0 30px rgba(99, 102, 241, 0.7);} }
         ::-webkit-scrollbar { width: 6px; } ::-webkit-scrollbar-track { background: #0f172a; } ::-webkit-scrollbar-thumb { background: #334155; border-radius: 3px; }
       `}</style>
-      <div style={{ width: "100%", maxWidth: 420, padding: 20 }}>
+      <div style={{ width: "100%", maxWidth: 440, padding: 20 }}>
         {/* Logo */}
-        <div style={{ textAlign: "center", marginBottom: 36 }}>
-          <div style={{ fontSize: 11, letterSpacing: 4, color: "#f59e0b", fontWeight: 500, textTransform: "uppercase", marginBottom: 8 }}>ATOMQUEST HACKATHON 1.0</div>
-          <h1 style={{ fontFamily: "'Syne', sans-serif", fontSize: 36, fontWeight: 800, color: "#f1f5f9", margin: 0, lineHeight: 1.1 }}>
-            Goal<span style={{ color: "#6366f1" }}>Track</span>
+        <div style={{ textAlign: "center", marginBottom: 40 }}>
+          <div style={{ fontSize: 12, letterSpacing: 5, color: "#38bdf8", fontWeight: 600, textTransform: "uppercase", marginBottom: 10 }}>ATOMQUEST HACKATHON 1.0</div>
+          <h1 style={{ fontFamily: "'Syne', sans-serif", fontSize: 42, fontWeight: 800, color: "#f8fafc", margin: 0, lineHeight: 1.1, textShadow: "0 2px 10px rgba(0,0,0,0.5)" }}>
+            Goal<span style={{ color: "#818cf8" }}>Track</span>
           </h1>
-          <p style={{ color: "#64748b", fontSize: 13, marginTop: 8 }}>Performance Management Portal</p>
+          <p style={{ color: "#94a3b8", fontSize: 14, marginTop: 10, fontWeight: 500 }}>Performance Management Portal</p>
         </div>
         {/* Card */}
-        <div style={{ background: "#0f172a", border: "1px solid #1e293b", borderRadius: 16, padding: 28 }}>
+        <div style={{ background: "rgba(30, 41, 59, 0.7)", backdropFilter: "blur(12px)", border: "1px solid rgba(255,255,255,0.05)", borderRadius: 24, padding: 32, boxShadow: "0 25px 50px -12px rgba(0,0,0,0.5)" }}>
           <form onSubmit={handleLogin}>
             <Field label="Email Address">
               <input value={email} onChange={e => setEmail(e.target.value)} type="email" placeholder="enter your email" style={inputStyle} required />
             </Field>
             {error && <p style={{ color: "#ef4444", fontSize: 13, margin: "0 0 12px" }}>{error}</p>}
             <button type="submit" disabled={loading} style={{
-              width: "100%", padding: "12px", background: "#6366f1", border: "none",
-              borderRadius: 10, color: "#fff", fontSize: 15, fontWeight: 700, cursor: "pointer",
-              fontFamily: "inherit", transition: "opacity 0.2s"
-            }}>{loading ? "Signing in…" : "Sign In"}</button>
+              width: "100%", padding: "14px", background: "linear-gradient(to right, #4f46e5, #6366f1)", border: "none",
+              borderRadius: 12, color: "#fff", fontSize: 16, fontWeight: 700, cursor: "pointer",
+              fontFamily: "inherit", transition: "all 0.3s ease", boxShadow: "0 4px 15px rgba(99, 102, 241, 0.4)"
+            }} onMouseOver={e => !loading && (e.currentTarget.style.transform = "translateY(-2px)")} onMouseOut={e => !loading && (e.currentTarget.style.transform = "translateY(0)")}>
+              {loading ? "Signing in…" : "Sign In"}
+            </button>
           </form>
+
+          {/* SSO Microsoft Button */}
+          <div style={{ marginTop: 24, paddingTop: 24, borderTop: "1px solid rgba(255,255,255,0.05)" }}>
+            <button onClick={handleSSOLogin} disabled={loading} style={{
+              width: "100%", padding: "14px", background: "#000", border: "1px solid #333",
+              borderRadius: 12, color: "#fff", fontSize: 15, fontWeight: 600, cursor: "pointer",
+              display: "flex", alignItems: "center", justifyContent: "center", gap: 10, transition: "background 0.2s"
+            }} onMouseOver={e => e.currentTarget.style.background="#111"} onMouseOut={e => e.currentTarget.style.background="#000"}>
+              <svg width="20" height="20" viewBox="0 0 21 21"><rect x="1" y="1" width="9" height="9" fill="#f25022"/><rect x="1" y="11" width="9" height="9" fill="#00a4ef"/><rect x="11" y="1" width="9" height="9" fill="#7fba00"/><rect x="11" y="11" width="9" height="9" fill="#ffb900"/></svg>
+              Sign in with Azure AD (SSO)
+            </button>
+          </div>
+
           {/* Demo accounts */}
-          <div style={{ marginTop: 20, paddingTop: 20, borderTop: "1px solid #1e293b" }}>
-            <p style={{ fontSize: 11, color: "#475569", textAlign: "center", marginBottom: 12, textTransform: "uppercase", letterSpacing: 1 }}>Demo Accounts</p>
-            <div style={{ display: "flex", gap: 8 }}>
+          <div style={{ marginTop: 24, paddingTop: 24, borderTop: "1px solid rgba(255,255,255,0.05)" }}>
+            <p style={{ fontSize: 12, color: "#64748b", textAlign: "center", marginBottom: 16, textTransform: "uppercase", letterSpacing: 1.5, fontWeight: 600 }}>Demo Accounts</p>
+            <div style={{ display: "flex", gap: 10 }}>
               {DEMO_ACCOUNTS.map(a => (
                 <button key={a.email} onClick={() => { setEmail(a.email); }} style={{
-                  flex: 1, background: "#1e293b", border: `1px solid #334155`,
-                  borderRadius: 10, padding: "10px 8px", cursor: "pointer", color: "#f1f5f9",
-                  fontFamily: "inherit", transition: "border-color 0.2s"
-                }} onMouseOver={e => e.currentTarget.style.borderColor = a.color} onMouseOut={e => e.currentTarget.style.borderColor = "#334155"}>
-                  <div style={{ fontSize: 18 }}>{a.icon}</div>
-                  <div style={{ fontSize: 11, fontWeight: 600, marginTop: 4, color: a.color }}>{a.label}</div>
+                  flex: 1, background: "rgba(15, 23, 42, 0.6)", border: `1px solid rgba(255,255,255,0.05)`,
+                  borderRadius: 12, padding: "12px 8px", cursor: "pointer", color: "#f8fafc",
+                  fontFamily: "inherit", transition: "all 0.2s ease"
+                }} onMouseOver={e => { e.currentTarget.style.borderColor = a.color; e.currentTarget.style.background = "rgba(15, 23, 42, 0.9)"; e.currentTarget.style.transform = "translateY(-2px)"; }} 
+                   onMouseOut={e => { e.currentTarget.style.borderColor = "rgba(255,255,255,0.05)"; e.currentTarget.style.background = "rgba(15, 23, 42, 0.6)"; e.currentTarget.style.transform = "translateY(0)"; }}>
+                  <div style={{ fontSize: 22, textShadow: "0 2px 4px rgba(0,0,0,0.3)" }}>{a.icon}</div>
+                  <div style={{ fontSize: 11, fontWeight: 700, marginTop: 6, color: a.color }}>{a.label}</div>
                 </button>
               ))}
             </div>
@@ -283,17 +358,22 @@ function PageHeader({ title, subtitle, action }) {
 
 function Btn({ onClick, children, variant = "primary", disabled, style: s }) {
   const styles = {
-    primary: { background: "#6366f1", color: "#fff" },
-    success: { background: "#10b981", color: "#fff" },
-    danger:  { background: "#ef4444", color: "#fff" },
-    ghost:   { background: "#1e293b", color: "#94a3b8", border: "1px solid #334155" },
+    primary: { background: "linear-gradient(to right, #4f46e5, #6366f1)", color: "#fff", boxShadow: "0 4px 15px rgba(99, 102, 241, 0.3)" },
+    success: { background: "linear-gradient(to right, #059669, #10b981)", color: "#fff", boxShadow: "0 4px 15px rgba(16, 185, 129, 0.3)" },
+    danger:  { background: "linear-gradient(to right, #dc2626, #ef4444)", color: "#fff", boxShadow: "0 4px 15px rgba(239, 68, 68, 0.3)" },
+    ghost:   { background: "rgba(30, 41, 59, 0.6)", color: "#cbd5e1", border: "1px solid rgba(255,255,255,0.05)" },
   };
   return (
     <button onClick={onClick} disabled={disabled} style={{
-      ...styles[variant], padding: "9px 18px", border: "none", borderRadius: 8,
-      fontSize: 13, fontWeight: 700, cursor: disabled ? "not-allowed" : "pointer",
-      fontFamily: "inherit", opacity: disabled ? 0.5 : 1, transition: "opacity 0.2s", ...s
-    }}>{children}</button>
+      ...styles[variant], padding: "10px 20px", border: "none", borderRadius: 10,
+      fontSize: 14, fontWeight: 600, cursor: disabled ? "not-allowed" : "pointer",
+      fontFamily: "inherit", opacity: disabled ? 0.6 : 1, transition: "all 0.2s ease",
+      ...s
+    }} onMouseOver={e => !disabled && (e.currentTarget.style.transform = "translateY(-1px)")}
+       onMouseOut={e => !disabled && (e.currentTarget.style.transform = "translateY(0)")}
+       onMouseDown={e => !disabled && (e.currentTarget.style.transform = "translateY(1px)")}>
+      {children}
+    </button>
   );
 }
 
@@ -587,41 +667,26 @@ function EmployeeCheckinsPage({ user, toast }) {
       score = calcScore(goal, av);
     }
     const payload = { goal_id: goal.id, quarter, [field]: value, score, updated_at: new Date().toISOString() };
-    
-    let updatedAch = null;
-    if (existing && existing.id) {
-      const { data } = await supabase.from("achievements").update(payload).eq("id", existing.id).select().single();
-      updatedAch = data;
+    if (existing) {
+      await supabase.from("achievements").update(payload).eq("id", existing.id);
     } else {
-      const { data } = await supabase.from("achievements").insert({ ...payload, progress_status: "not_started" }).select().single();
-      updatedAch = data;
+      await supabase.from("achievements").insert({ ...payload, progress_status: "not_started" });
     }
-    
-    if (updatedAch) {
-      setAchievements(p => ({
-        ...p, [goal.id]: { ...p[goal.id], [quarter]: updatedAch }
-      }));
-    }
+    setAchievements(p => ({
+      ...p, [goal.id]: { ...p[goal.id], [quarter]: { ...(p[goal.id]?.[quarter] || {}), [field]: value, score } }
+    }));
     setSaving(p => ({ ...p, [goal.id]: false }));
   }
 
   async function saveStatus(goal, status) {
     if (!isQuarterOpen(quarter)) { toast.error(`Quarter ${quarter.toUpperCase()} update window is closed`); return; }
     const existing = achievements[goal.id]?.[quarter];
-    let updatedAch = null;
-    if (existing && existing.id) {
-      const { data } = await supabase.from("achievements").update({ progress_status: status }).eq("id", existing.id).select().single();
-      updatedAch = data;
+    if (existing) {
+      await supabase.from("achievements").update({ progress_status: status }).eq("id", existing.id);
     } else {
-      const { data } = await supabase.from("achievements").insert({ goal_id: goal.id, quarter, progress_status: status, score: null }).select().single();
-      updatedAch = data;
+      await supabase.from("achievements").insert({ goal_id: goal.id, quarter, progress_status: status, score: null });
     }
-    
-    if (updatedAch) {
-      setAchievements(p => ({
-        ...p, [goal.id]: { ...p[goal.id], [quarter]: updatedAch }
-      }));
-    }
+    setAchievements(p => ({ ...p, [goal.id]: { ...p[goal.id], [quarter]: { ...(p[goal.id]?.[quarter] || {}), progress_status: status } } }));
     toast.success("Status updated");
   }
 
@@ -659,7 +724,7 @@ function EmployeeCheckinsPage({ user, toast }) {
             const ach = achievements[goal.id]?.[quarter] || {};
             const isTimeline = goal.uom_type === "timeline";
             return (
-              <div key={goal.id} style={{ background: "#0f172a", border: "1px solid #1e293b", borderRadius: 12, padding: 20 }}>
+              <div key={goal.id} style={{ background: "#0f172a", border: "1px solid #1e293b", borderRadius: 10, padding: 20 }}>
                 <div style={{ display: "flex", gap: 10, marginBottom: 10, flexWrap: "wrap" }}>
                   <span style={{ fontSize: 11, background: "#1e293b", padding: "2px 8px", borderRadius: 6, color: "#94a3b8" }}>{goal.thrust_area}</span>
                   <span style={{ fontSize: 11, color: "#94a3b8" }}>{UOM_TYPES.find(u => u.value === goal.uom_type)?.label.split("(")[0].trim()}</span>
@@ -1293,7 +1358,7 @@ function AuditLogPage() {
               <tr><td colSpan="4" style={{ padding: 40, textAlign: "center", color: "#64748b" }}>No logs recorded yet.</td></tr>
             ) : (
               logs.map(log => (
-                <tr key={log.id} style={{ borderBottom: "1px solid #1e293b" }}>
+                <tr key={log.id} style={{ borderBottom: "1px solid #0f172a" }}>
                   <td style={{ padding: "10px 16px", color: "#f1f5f9" }}>{new Date(log.created_at).toLocaleString()}</td>
                   <td style={{ padding: "10px 16px", color: "#94a3b8" }}>{log.changed_by?.name || "System"} <span style={{ fontSize: 11, color: "#64748b" }}>({log.changed_by?.role || "unknown"})</span></td>
                   <td style={{ padding: "10px 16px", color: "#6366f1", fontWeight: 600 }}>{log.action?.replace(/_/g, " ").toUpperCase()}</td>
